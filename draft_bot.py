@@ -112,6 +112,8 @@ class DraftState:
         self.picks_by_team[member.id].append(item_name)
         self.picked_items.add(item_name)
 
+        self.cancel_timer() 
+
         # Advance
         self.advance_turn()
 
@@ -139,10 +141,71 @@ class DraftState:
             self.current_round += 1
             self.direction = 1
             self.current_index = 0
+    def cancel_timer(self):
+        if self.turn_timer_task and not self.turn_timer_task.done():
+            self.turn_timer_task.cancel()
+        self.turn_timer_task = None
+
 
 
 # One draft per guild (server)
 guild_drafts = {}  # guild_id -> DraftState
+
+def parse_timer_duration(text: str):
+    normalized = text.lower().replace(" ", "")
+    allowed = {
+        "30": 30,
+        "30s": 30,
+        "30sec": 30,
+        "30secs": 30,
+        "30seconds": 30,
+        "1m": 60,
+        "1min": 60,
+        "1minute": 60,
+        "60": 60,
+        "60s": 60,
+        "90": 90,
+        "90s": 90,
+        "90sec": 90,
+        "90secs": 90,
+        "90seconds": 90,
+        "2m": 120,
+        "2min": 120,
+        "2minutes": 120,
+        "120": 120,
+        "120s": 120,
+    }
+    return allowed.get(normalized)
+
+
+def format_duration(seconds: int):
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{seconds} seconds"
+
+
+async def run_turn_timer(ctx, draft: DraftState, duration_seconds: int):
+    team = draft.current_team()
+    round_number = draft.current_round
+    if team is None:
+        return
+
+    try:
+        await asyncio.sleep(duration_seconds)
+    except asyncio.CancelledError:
+        return
+
+    if draft.turn_timer_task != asyncio.current_task():
+        return
+
+    draft.turn_timer_task = None
+
+    if draft.completed or draft.current_team() != team or draft.current_round != round_number:
+        return
+
+    await ctx.send(f"⏰ Time's up for {team.mention}! Please make your pick.")
+
 
 
 # ===============================
@@ -691,6 +754,50 @@ async def show_teams(ctx):
 
     table = "\n".join([header] + rows)
     await ctx.send(f"📋 Teams:\n```{table}```")
+
+
+
+@bot.command(name="timer")
+async def start_timer(ctx, *, duration: str):
+    """Start a turn timer (owner only). Options: 30s, 1m, 90s, 2m."""
+    guild_id = ctx.guild.id
+    draft = guild_drafts.get(guild_id)
+
+    if draft is None:
+        await ctx.send("No active draft.")
+        return
+
+    if ctx.author.id != draft.owner_id:
+        await ctx.send("Only the draft creator can start a timer.")
+        return
+
+    if not draft.started:
+        await ctx.send("You need to begin the draft before starting a timer.")
+        return
+
+    if draft.completed:
+        await ctx.send("Draft is already complete.")
+        return
+
+    seconds = parse_timer_duration(duration)
+    if seconds is None:
+        await ctx.send("Invalid duration. Choose one of: 30s, 1m, 90s, 2m.")
+        return
+
+    team = draft.current_team()
+    if team is None:
+        await ctx.send("There is no active turn to time.")
+        return
+
+    draft.cancel_timer()
+
+    task = asyncio.create_task(run_turn_timer(ctx, draft, seconds))
+    draft.turn_timer_task = task
+
+    await ctx.send(
+        f"⏳ Timer started for {team.mention}: {format_duration(seconds)}."
+    )
+
 
 
 
