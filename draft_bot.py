@@ -1,3 +1,4 @@
+import asyncio
 import os
 import discord
 from discord.ext import commands
@@ -32,16 +33,19 @@ class DraftState:
         self.available_items = []        # list of strings (players/items)
         self.picks_by_team = {}          # member_id -> [items]
         self.picked_items = set()        # set of already picked item names
+        self.turn_timer_task = None
+        self.item_sides = {}             # item name -> side label
 
     def add_team(self, member):
         if member not in self.teams:
             self.teams.append(member)
             self.picks_by_team[member.id] = []
 
-    def set_pool(self, items):
+    def set_pool(self, items, item_sides=None):
         # items: list[str]
         self.available_items = items
         self.picked_items = set()
+        self.item_sides = item_sides or {}
 
     def begin(self):
         # lock teams and start
@@ -93,6 +97,8 @@ class DraftState:
         self.picks_by_team[member.id].append(item_name)
         self.picked_items.add(item_name)
 
+        self.cancel_timer()
+
         # advance pointer
         self.advance_turn()
 
@@ -120,9 +126,97 @@ class DraftState:
             self.direction = 1
             self.current_index = 0
 
+    def cancel_timer(self):
+        if self.turn_timer_task and not self.turn_timer_task.done():
+            self.turn_timer_task.cancel()
+        self.turn_timer_task = None
+
 
 # One draft per guild (server) for simplicity
 guild_drafts = {}  # guild_id -> DraftState
+
+
+def parse_pool_with_sides(items_text: str):
+    """Parse text formatted as "Side A: p1, p2 | Side B: p3".
+
+    Returns a list of (side, [items]) tuples when the format is valid, or
+    ``None`` when the text either does not contain any groups or when a colon
+    delimiter is missing (indicating the caller should treat the input as a
+    simple comma-separated list instead).
+    """
+
+    chunks = [chunk.strip() for chunk in items_text.split("|") if chunk.strip()]
+    if not chunks:
+        return None
+
+    groups = []
+    for chunk in chunks:
+        if ":" not in chunk:
+            return None
+        side, entries = chunk.split(":", 1)
+        side = side.strip()
+        items = [item.strip() for item in entries.split(",") if item.strip()]
+        if not side or not items:
+            continue
+        groups.append((side, items))
+
+    return groups or None
+
+
+def parse_timer_duration(text: str):
+    normalized = text.lower().replace(" ", "")
+    allowed = {
+        "30": 30,
+        "30s": 30,
+        "30sec": 30,
+        "30secs": 30,
+        "30seconds": 30,
+        "1m": 60,
+        "1min": 60,
+        "1minute": 60,
+        "60": 60,
+        "60s": 60,
+        "90": 90,
+        "90s": 90,
+        "90sec": 90,
+        "90secs": 90,
+        "90seconds": 90,
+        "2m": 120,
+        "2min": 120,
+        "2minutes": 120,
+        "120": 120,
+        "120s": 120,
+    }
+    return allowed.get(normalized)
+
+
+def format_duration(seconds: int):
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{seconds} seconds"
+
+
+async def run_turn_timer(ctx, draft: DraftState, duration_seconds: int):
+    team = draft.current_team()
+    round_number = draft.current_round
+    if team is None:
+        return
+
+    try:
+        await asyncio.sleep(duration_seconds)
+    except asyncio.CancelledError:
+        return
+
+    if draft.turn_timer_task != asyncio.current_task():
+        return
+
+    draft.turn_timer_task = None
+
+    if draft.completed or draft.current_team() != team or draft.current_round != round_number:
+        return
+
+    await ctx.send(f"⏰ Time's up for {team.mention}! Please make your pick.")
 
 
 # --- Commands ---
@@ -175,6 +269,8 @@ async def set_pool(ctx, *, items_text: str):
     Set the draft pool as a comma-separated list.
     Example:
     !setpool Patrick Mahomes, CeeDee Lamb, Christian McCaffrey
+    You can also group by side for clarity (e.g., real teams):
+    !setpool Chiefs: Patrick Mahomes, Travis Kelce | 49ers: Christian McCaffrey, Deebo Samuel
     """
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
@@ -187,13 +283,47 @@ async def set_pool(ctx, *, items_text: str):
         await ctx.send("Only the draft owner can set the draft pool.")
         return
 
-    items = [i.strip() for i in items_text.split(",") if i.strip()]
+    side_groups = parse_pool_with_sides(items_text)
+
+    items = []
+    item_sides = {}
+
+    if side_groups:
+        for side, entries in side_groups:
+            for item in entries:
+                if item in item_sides:
+                    await ctx.send(f"Duplicate item detected: {item}")
+                    return
+                items.append(item)
+                item_sides[item] = side
+    else:
+        if ":" in items_text and "|" in items_text:
+            await ctx.send(
+                "Pool format looks grouped but is invalid. "
+                "Use `Side: item1, item2 | Side2: item3`."
+            )
+            return
+        items = [i.strip() for i in items_text.split(",") if i.strip()]
+
     if not items:
         await ctx.send("You must provide at least one item.")
         return
 
-    draft.set_pool(items)
-    await ctx.send(f"✅ Draft pool set with **{len(items)} items**.")
+    draft.set_pool(items, item_sides)
+
+    if item_sides:
+        counts_by_side = {}
+        for side in item_sides.values():
+            counts_by_side[side] = counts_by_side.get(side, 0) + 1
+        side_counts = ", ".join(
+            f"{side}: {count}" for side, count in sorted(counts_by_side.items())
+        )
+        await ctx.send(
+            f"✅ Draft pool set with **{len(items)} items** across sides.\n"
+            f"Breakdown — {side_counts}"
+        )
+    else:
+        await ctx.send(f"✅ Draft pool set with **{len(items)} items**.")
 
 
 @bot.command(name="begin")
@@ -228,6 +358,48 @@ async def begin_draft(ctx):
         "🚨 Draft has begun!\n"
         f"Order: {order_names}\n"
         f"Current turn: {draft.current_team().mention} (Round {draft.current_round})"
+    )
+
+
+@bot.command(name="timer")
+async def start_timer(ctx, *, duration: str):
+    """Start a turn timer (owner only). Options: 30s, 1m, 90s, 2m."""
+    guild_id = ctx.guild.id
+    draft = guild_drafts.get(guild_id)
+
+    if draft is None:
+        await ctx.send("No active draft.")
+        return
+
+    if ctx.author.id != draft.owner_id:
+        await ctx.send("Only the draft creator can start a timer.")
+        return
+
+    if not draft.started:
+        await ctx.send("You need to begin the draft before starting a timer.")
+        return
+
+    if draft.completed:
+        await ctx.send("Draft is already complete.")
+        return
+
+    seconds = parse_timer_duration(duration)
+    if seconds is None:
+        await ctx.send("Invalid duration. Choose one of: 30s, 1m, 90s, 2m.")
+        return
+
+    team = draft.current_team()
+    if team is None:
+        await ctx.send("There is no active turn to time.")
+        return
+
+    draft.cancel_timer()
+
+    task = asyncio.create_task(run_turn_timer(ctx, draft, seconds))
+    draft.turn_timer_task = task
+
+    await ctx.send(
+        f"⏳ Timer started for {team.mention}: {format_duration(seconds)}."
     )
 
 
@@ -319,9 +491,70 @@ async def show_pool(ctx):
         await ctx.send("No remaining items in the pool.")
         return
 
-    display = ", ".join(remaining[:50])
-    extra = "" if len(remaining) <= 50 else f" (+{len(remaining) - 50} more)"
-    await ctx.send(f"Remaining items ({len(remaining)} total):\n{display}{extra}")
+    if draft.item_sides:
+        grouped = {}
+        for item in remaining:
+            side = draft.item_sides.get(item, "Unspecified")
+            grouped.setdefault(side, []).append(item)
+
+        lines = []
+        for side, items in sorted(grouped.items()):
+            sorted_items = sorted(items)
+            display = ", ".join(sorted_items[:10])
+            extra = "" if len(sorted_items) <= 10 else f" (+{len(sorted_items) - 10} more)"
+            lines.append(f"{side} ({len(items)}): {display}{extra}")
+
+        lines_text = "\n".join(lines)
+        await ctx.send(
+            f"Remaining items by side ({len(remaining)} total):\n{lines_text}"
+        )
+    else:
+        display = ", ".join(remaining[:50])
+        extra = "" if len(remaining) <= 50 else f" (+{len(remaining) - 50} more)"
+        await ctx.send(f"Remaining items ({len(remaining)} total):\n{display}{extra}")
+
+
+@bot.command(name="teams")
+async def show_teams(ctx):
+    """Show each team's picks in a side-by-side table."""
+    guild_id = ctx.guild.id
+    draft = guild_drafts.get(guild_id)
+
+    if draft is None:
+        await ctx.send("No active draft.")
+        return
+
+    teams = draft.draft_order if draft.draft_order else draft.teams
+    if not teams:
+        await ctx.send("No teams have joined the draft yet.")
+        return
+
+    # Build column widths based on team names and their longest pick
+    picks_by_team = [draft.picks_by_team.get(team.id, []) for team in teams]
+    column_widths = []
+    for team, picks in zip(teams, picks_by_team):
+        longest_pick = max((len(pick) for pick in picks), default=0)
+        column_widths.append(max(len(team.display_name), longest_pick) + 2)
+
+    header = " | ".join(
+        team.display_name.ljust(width) for team, width in zip(teams, column_widths)
+    )
+
+    max_rows = max((len(picks) for picks in picks_by_team), default=0)
+    if max_rows == 0:
+        await ctx.send(f"📋 Teams:\n```{header}```")
+        return
+
+    rows = []
+    for i in range(max_rows):
+        row = " | ".join(
+            (picks[i] if i < len(picks) else "").ljust(width)
+            for picks, width in zip(picks_by_team, column_widths)
+        )
+        rows.append(row)
+
+    table = "\n".join([header] + rows)
+    await ctx.send(f"📋 Teams:\n```{table}```")
 
 
 @bot.command(name="order")
