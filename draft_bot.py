@@ -1,3 +1,4 @@
+import asyncio
 import os
 import random
 import asyncio
@@ -45,6 +46,8 @@ class DraftState:
         self.available_items = []    # list[str] - all possible picks
         self.picks_by_team = {}      # dict[user_id, list[str]]
         self.picked_items = set()    # set[str] - already drafted
+        self.turn_timer_task = None
+        self.item_sides = {}             # item name -> side label
 
     def add_team(self, member: discord.Member):
         """Add a team to the draft if not already there."""
@@ -52,10 +55,13 @@ class DraftState:
             self.teams.append(member)
             self.picks_by_team[member.id] = []
 
+            def set_pool(self, items, item_sides=None):
+
     def set_pool(self, items):
         """Set the list of available draft items."""
         self.available_items = items
         self.picked_items = set()
+        self.item_sides = item_sides or {}      
 
     def begin(self):
         """Lock teams and start the draft."""
@@ -390,6 +396,7 @@ async def start_draft(ctx, rounds: int):
         f"Others can join with `!join`.\n"
         f"The owner can set the pool with `!setpool` or `!setpooldm`, and can randomize order with `!fliporder`.\n"
         f"Once the draft starts, players just type the name (or part of the name) of the item to pick."
+    
     )
 
 
@@ -417,6 +424,8 @@ async def set_pool(ctx, *, items_text: str):
     Set the draft pool as a comma-separated list (in-channel).
     Example:
     !setpool Patrick Mahomes, CeeDee Lamb, Christian McCaffrey
+     You can also group by side for clarity (e.g., real teams):
+    !setpool Chiefs: Patrick Mahomes, Travis Kelce | 49ers: Christian McCaffrey, Deebo Samuel
     """
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
@@ -428,17 +437,40 @@ async def set_pool(ctx, *, items_text: str):
     if ctx.author.id != draft.owner_id:
         await ctx.send("❌ Only the draft owner can set the draft pool.")
         return
+    
+        side_groups = parse_pool_with_sides(items_text)
 
-    items = [i.strip() for i in items_text.split(",") if i.strip()]
+    if side_groups:
+        items = []
+        item_sides = {}
+        for side, entries in side_groups:
+            for item in entries:
+                if item in item_sides:
+                    await ctx.send(f"Duplicate item detected: {item}")
+                    return
+                items.append(item)
+                item_sides[item] = side
+    else:
+        items = [i.strip() for i in items_text.split(",") if i.strip()]
+        item_sides = {}
+
     if not items:
         await ctx.send("❌ You must provide at least one item.")
         return
+    draft.set_pool(items, item_sides)
 
-    draft.set_pool(items)
-    await ctx.send(
-        f"✅ Draft pool set with **{len(items)}** items.\n"
-        f"Players will be able to draft by simply typing the item name (case-insensitive, partials allowed)."
-    )
+    if item_sides:
+        counts_by_side = {}
+        for side in item_sides.values():
+            counts_by_side[side] = counts_by_side.get(side, 0) + 1
+        side_counts = ", ".join(f"{side}: {count}" for side, count in counts_by_side.items())
+        await ctx.send(
+            f"✅ Draft pool set with **{len(items)} items** across sides.\n"
+            f"Breakdown — {side_counts}"
+        )
+    else:
+        await ctx.send(f"✅ Draft pool set with **{len(items)} items**.")
+   
 
 
 @bot.command(name="setpooldm")
@@ -690,8 +722,27 @@ async def show_pool(ctx):
         await ctx.send("❌ No active draft.")
         return
 
-    embed = build_pool_embed(draft)
-    await ctx.send(embed=embed)
+   if draft.item_sides:
+        grouped = {}
+        for item in remaining:
+            side = draft.item_sides.get(item, "Unspecified")
+            grouped.setdefault(side, []).append(item)
+
+        lines = []
+        for side, items in grouped.items():
+            display = ", ".join(items[:10])
+            extra = "" if len(items) <= 10 else f" (+{len(items) - 10} more)"
+            lines.append(f"{side}: {display}{extra}")
+
+        lines_text = "\n".join(lines)
+        await ctx.send(
+            f"Remaining items by side ({len(remaining)} total):\n{lines_text}"
+        )
+    else:
+        display = ", ".join(remaining[:50])
+        extra = "" if len(remaining) <= 50 else f" (+{len(remaining) - 50} more)"
+        await ctx.send(f"Remaining items ({len(remaining)} total):\n{display}{extra}")
+
 
 
 @bot.command(name="order")
