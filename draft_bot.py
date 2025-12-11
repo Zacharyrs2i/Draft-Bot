@@ -1,6 +1,6 @@
+import asyncio
 import os
 import random
-import asyncio
 
 import discord
 from discord.ext import commands
@@ -9,13 +9,6 @@ from dotenv import load_dotenv
 # ===============================
 # SETUP
 # ===============================
-
-# Load environment variables from .env
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is not set in .env")
 
 # Intents: need message_content so the bot can see text messages
 intents = discord.Intents.default()
@@ -28,40 +21,46 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # DRAFT STATE CLASS
 # ===============================
 
+
 class DraftState:
     def __init__(self, owner_id: int, rounds: int):
         self.owner_id = owner_id
         self.rounds = rounds
 
-        self.teams = []              # list[discord.Member]
-        self.draft_order = []        # list[discord.Member]
+        self.teams = []  # list[discord.Member]
+        self.draft_order = []  # list[discord.Member]
 
         self.current_round = 1
-        self.current_index = 0       # index in draft_order
-        self.direction = 1           # 1 = forward, -1 = backward (snake)
+        self.current_index = 0  # index in draft_order
+        self.direction = 1  # 1 = forward, -1 = backward (snake)
         self.started = False
         self.completed = False
 
-        self.available_items = []    # list[str] - all possible picks
-        self.picks_by_team = {}      # dict[user_id, list[str]]
-        self.picked_items = set()    # set[str] - already drafted
+        self.available_items = []  # list[str] - all possible picks
+        self.picks_by_team = {}  # dict[user_id, list[str]]
+        self.picked_items = set()  # set[str] - already drafted
 
-        self.item_sides = {}         # item name -> side label (e.g., "Rangers")
+        self.item_sides = {}  # item name -> side label (e.g., "Rangers")
+        self.side_picks = {}  # user_id -> {side: count}
         self.turn_timer_task = None  # asyncio.Task for current turn timer
 
-        self.test_mode = False       # allow single-team drafts for testing
+        self.test_mode = False  # allow single-team drafts for testing
 
     def add_team(self, member: discord.Member):
         """Add a team to the draft if not already there."""
         if member not in self.teams:
             self.teams.append(member)
             self.picks_by_team[member.id] = []
+            # Initialize side_picks bucket for this member
+            if member.id not in self.side_picks:
+                self.side_picks[member.id] = {}
 
     def set_pool(self, items, item_sides=None):
         """Set the list of available draft items."""
         self.available_items = items
         self.picked_items = set()
         self.item_sides = item_sides or {}
+        self.side_picks = {}
 
     def begin(self):
         """Lock teams and start the draft."""
@@ -89,7 +88,7 @@ class DraftState:
     def max_picks_total(self) -> int:
         return self.rounds * len(self.draft_order) if self.draft_order else 0
 
-       def can_pick(self, member: discord.Member, item_name: str):
+    def can_pick(self, member: discord.Member, item_name: str):
         """Check if this member can pick this item now."""
         if not self.started or self.completed:
             return False, "Draft has not started or is already complete."
@@ -106,11 +105,8 @@ class DraftState:
         if self.total_picks_for_team(member.id) >= self.rounds:
             return False, "You have already made all your picks."
 
-        # ===============================
-        # 1-for-1 SIDE BALANCING LOGIC
-        # ===============================
+        # 1-for-1 side balancing logic
         side = self.item_sides.get(item_name)
-
         if side is not None and self.rounds >= 2:
             all_sides = set(self.item_sides.values())
             if len(all_sides) == 2:
@@ -127,9 +123,8 @@ class DraftState:
                     )
 
         return True, None
-    
 
-        def make_pick(self, member: discord.Member, item_name: str):
+    def make_pick(self, member: discord.Member, item_name: str):
         """Record a pick and advance the turn."""
         ok, error = self.can_pick(member, item_name)
         if not ok:
@@ -157,7 +152,6 @@ class DraftState:
             self.completed = True
 
         return True, None
-
 
     def advance_turn(self):
         """Move pointer for the snake draft."""
@@ -313,6 +307,7 @@ def build_pool_embed(draft: DraftState) -> discord.Embed:
 # EVENTS
 # ===============================
 
+
 @bot.event
 async def on_ready():
     print(">>> on_ready FIRED <<<")
@@ -364,7 +359,6 @@ async def try_auto_pick(message: discord.Message):
     if len(exact_matches) == 1:
         matched_item = exact_matches[0]
     elif len(exact_matches) > 1:
-        # This is unlikely, but handle it
         possibilities = ", ".join(exact_matches)
         await message.channel.send(
             f"⚠️ That matches multiple remaining items exactly: {possibilities}. "
@@ -378,7 +372,6 @@ async def try_auto_pick(message: discord.Message):
         if len(partial_matches) == 1:
             matched_item = partial_matches[0]
         elif len(partial_matches) > 1:
-            # Too many possibilities – ask to be more specific
             show = partial_matches[:10]
             options = "\n".join(f"- {name}" for name in show)
             extra = "" if len(partial_matches) <= 10 else f"\n(+ {len(partial_matches) - 10} more...)"
@@ -388,23 +381,20 @@ async def try_auto_pick(message: discord.Message):
             )
             return
         else:
-            # No match; silently ignore so people can chat
             return
 
-    # At this point, matched_item is a unique, valid remaining item
+    # Make the pick
     ok, error = draft.make_pick(member, matched_item)
     if not ok:
         await message.channel.send(f"❌ {error}")
         return
 
-    # Confirm the pick
     await message.channel.send(f"✅ {member.mention} drafted **{matched_item}**!")
 
-    # Show remaining pool as an embed
+    # Show remaining pool
     pool_embed = build_pool_embed(draft)
     await message.channel.send(embed=pool_embed)
 
-    # Turn / completion info
     if draft.completed:
         await message.channel.send("🎉 Draft is complete!")
     else:
@@ -430,6 +420,7 @@ async def on_message(message: discord.Message):
 # UTILITY COMMANDS
 # ===============================
 
+
 @bot.command()
 async def ping(ctx):
     """Simple test command."""
@@ -439,6 +430,7 @@ async def ping(ctx):
 # ===============================
 # DRAFT COMMANDS
 # ===============================
+
 
 @bot.command(name="startdraft")
 async def start_draft(ctx, rounds: int):
@@ -722,7 +714,7 @@ async def begin_draft(ctx):
 
 
 @bot.command(name="pick")
-async def make_pick(ctx, *, item_name: str):
+async def make_pick_cmd(ctx, *, item_name: str):
     """
     OPTIONAL: Make your draft pick via command.
     Example: !pick Patrick Mahomes
@@ -948,10 +940,6 @@ async def start_timer(ctx, *, duration: str):
     )
 
 
-# ===============================
-# FORCE STOP COMMAND
-# ===============================
-
 @bot.command(name="forcestop")
 @commands.has_permissions(administrator=True)
 async def force_stop(ctx):
@@ -974,10 +962,6 @@ async def force_stop(ctx):
     del guild_drafts[guild_id]
     await ctx.send("⛔ **The draft has been forcefully stopped.** All draft data has been cleared.")
 
-
-# ===============================
-# EXPORT DRAFT LOG
-# ===============================
 
 @bot.command(name="exportdraft")
 async def export_draft(ctx):
@@ -1022,7 +1006,19 @@ async def export_draft(ctx):
 # RUN THE BOT
 # ===============================
 
-print("TOKEN loaded? ", bool(TOKEN))
-print("TOKEN preview: ", TOKEN[:6] + "..." if TOKEN else "None")
+def load_token() -> str:
+    """Load the Discord token from the environment."""
+    load_dotenv()
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN is not set in .env")
+    return token
 
-bot.run(TOKEN)
+
+if __name__ == "__main__":
+    token = load_token()
+
+    print("TOKEN loaded? ", bool(token))
+    print("TOKEN preview: ", token[:6] + "..." if token else "None")
+
+    bot.run(token)
