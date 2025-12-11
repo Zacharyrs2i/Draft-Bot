@@ -41,7 +41,7 @@ class DraftState:
         self.picked_items = set()  # set[str] - already drafted
 
         self.item_sides = {}  # item name -> side label (e.g., "Rangers")
-        self.side_picks = {}  # user_id -> {side: count}
+        self.last_side_picked = {}  # user_id -> last side name (or None)
         self.turn_timer_task = None  # asyncio.Task for current turn timer
 
         self.test_mode = False  # allow single-team drafts for testing
@@ -51,16 +51,16 @@ class DraftState:
         if member not in self.teams:
             self.teams.append(member)
             self.picks_by_team[member.id] = []
-            # Initialize side_picks bucket for this member
-            if member.id not in self.side_picks:
-                self.side_picks[member.id] = {}
+            # Initialize last_side_picked for this member
+            if member.id not in self.last_side_picked:
+                self.last_side_picked[member.id] = None
 
     def set_pool(self, items, item_sides=None):
         """Set the list of available draft items."""
         self.available_items = items
         self.picked_items = set()
         self.item_sides = item_sides or {}
-        self.side_picks = {}
+        # Do not reset last_side_picked here; it's per-team over the draft
 
     def begin(self):
         """Lock teams and start the draft."""
@@ -105,21 +105,57 @@ class DraftState:
         if self.total_picks_for_team(member.id) >= self.rounds:
             return False, "You have already made all your picks."
 
-        # 1-for-1 side balancing logic
+        # Strict alternation logic: if there are exactly two sides,
+        # a team must alternate between them *while both sides still have options*.
         side = self.item_sides.get(item_name)
-        if side is not None and self.rounds >= 2:
+        if side is not None:
             all_sides = set(self.item_sides.values())
             if len(all_sides) == 2:
-                max_per_side = self.rounds // 2
+                last_side = self.last_side_picked.get(member.id)
 
-                counts_for_member = self.side_picks.get(member.id, {})
-                current_for_side = counts_for_member.get(side, 0)
+                # Figure out the "other" side
+                other_side = next((s for s in all_sides if s != side), None)
 
-                if max_per_side > 0 and current_for_side >= max_per_side:
+                # Check if the other side still has any remaining items
+                other_side_has_remaining = False
+                if other_side is not None:
+                    for i in self.available_items:
+                        if (
+                            i not in self.picked_items
+                            and self.item_sides.get(i) == other_side
+                        ):
+                            other_side_has_remaining = True
+                            break
+
+                # Only enforce alternation if:
+                #  - the last pick was from this same side, AND
+                #  - the other side still has items available.
+                if (
+                    last_side is not None
+                    and last_side == side
+                    and other_side_has_remaining
+                ):
+                    return False, (
+                        f"Your last pick was from **{last_side}**. "
+                        f"This pick must be from **{other_side}**."
+                    )
+
+        return True, None
+
+
+        # Strict alternation logic: if there are exactly two sides,
+        # a team must alternate between them each time they pick.
+        side = self.item_sides.get(item_name)
+        if side is not None:
+            all_sides = set(self.item_sides.values())
+            if len(all_sides) == 2:
+                last_side = self.last_side_picked.get(member.id)
+                if last_side is not None and last_side == side:
+                    # Determine the other side's name for the message
                     other_side = next(s for s in all_sides if s != side)
                     return False, (
-                        f"You've already taken the maximum number of **{side}** picks "
-                        f"({max_per_side}). Your remaining picks must be from **{other_side}**."
+                        f"Your last pick was from **{last_side}**. "
+                        f"This pick must be from **{other_side}**."
                     )
 
         return True, None
@@ -134,12 +170,10 @@ class DraftState:
         self.picks_by_team[member.id].append(item_name)
         self.picked_items.add(item_name)
 
-        # Track side usage for 1-for-1 logic
+        # Track side for alternation logic
         side = self.item_sides.get(item_name)
-        if side:
-            if member.id not in self.side_picks:
-                self.side_picks[member.id] = {}
-            self.side_picks[member.id][side] = self.side_picks[member.id].get(side, 0) + 1
+        if side is not None:
+            self.last_side_picked[member.id] = side
 
         # Stop any active timer
         self.cancel_timer()
@@ -277,9 +311,16 @@ def parse_pool_with_sides(text: str):
 # ===============================
 
 def build_pool_embed(draft: DraftState) -> discord.Embed:
-    """Create an embed showing remaining items in the pool."""
+    """Create an embed showing remaining items in the pool.
+
+    If there are exactly two sides (e.g., Rangers / Regulars), show a
+    two-column table:
+        Rangers | Regulars
+    Otherwise, fall back to a simple list.
+    """
     remaining = [i for i in draft.available_items if i not in draft.picked_items]
 
+    # Base embed
     embed = discord.Embed(
         title="Remaining Draft Pool",
         description=f"{len(remaining)} items left",
@@ -288,6 +329,62 @@ def build_pool_embed(draft: DraftState) -> discord.Embed:
     if not remaining:
         embed.description = "No remaining items in the pool."
         return embed
+
+    # If we have side information and exactly two sides, build a table view
+    if draft.item_sides:
+        grouped: dict[str, list[str]] = {}
+        for item in remaining:
+            side = draft.item_sides.get(item, "Unspecified")
+            grouped.setdefault(side, []).append(item)
+
+        sides = list(grouped.keys())
+        if len(sides) == 2:
+            left_side, right_side = sides[0], sides[1]
+            left_items = grouped[left_side]
+            right_items = grouped[right_side]
+
+            max_rows = max(len(left_items), len(right_items))
+            max_rows_shown = min(max_rows, 20)  # keep under Discord field limit
+
+            # Build table lines using monospaced formatting
+            header = f"{left_side:<16} | {right_side:<16}"
+            divider = "-" * len(header)
+            rows = [header, divider]
+
+            for i in range(max_rows_shown):
+                left_name = left_items[i] if i < len(left_items) else ""
+                right_name = right_items[i] if i < len(right_items) else ""
+                rows.append(f"{left_name:<16} | {right_name:<16}")
+
+            table_text = "```text\n" + "\n".join(rows) + "\n```"
+
+            extra = ""
+            if max_rows > max_rows_shown:
+                extra = f"\n(+ {max_rows - max_rows_shown} more rows not shown)"
+
+            embed.description = (
+                f"{len(remaining)} items left\n"
+                f"{left_side}: {len(left_items)}, {right_side}: {len(right_items)}"
+            )
+            embed.add_field(
+                name="Available by side",
+                value=table_text + extra,
+                inline=False,
+            )
+            return embed
+
+    # Fallback: simple single-column list (old behavior)
+    max_show = 25
+    lines = [f"- {name}" for name in remaining[:max_show]]
+    more_count = len(remaining) - max_show
+
+    text = "\n".join(lines)
+    if more_count > 0:
+        text += f"\n\n+ {more_count} more not shown..."
+
+    embed.add_field(name="Available", value=text, inline=False)
+    return embed
+
 
     # Show up to 25 items nicely formatted
     max_show = 25
@@ -502,10 +599,10 @@ async def set_pool(ctx, *, items_text: str):
     """
     Set the draft pool as a comma-separated list (in-channel).
     Example:
-    !setpool Patrick Mahomes, CeeDee Lamb, Christian McCaffrey
+    !setpool Player A, Player B, Player C
 
     You can also group by side for clarity (e.g., real teams):
-    !setpool Rangers: Option 1, Option 2 | Regulars: Option 3, Option 4
+    !setpool Rangers: Yeert, Fusion, Mike | Regulars: Bob, Alice, Carol
     """
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
@@ -583,9 +680,9 @@ async def set_pool_dm(ctx):
             "Please send me a message containing **all items** you want in the pool.\n"
             "You can separate them by **commas** or put **one per line**.\n\n"
             "Example:\n"
-            "`Patrick Mahomes, Josh Allen, Joe Burrow`\n"
+            "`Player A, Player B, Player C`\n"
             "or\n"
-            "`Patrick Mahomes\nJosh Allen\nJoe Burrow`"
+            "`Player A\nPlayer B\nPlayer C`"
         )
     except discord.Forbidden:
         await ctx.send(
@@ -717,7 +814,7 @@ async def begin_draft(ctx):
 async def make_pick_cmd(ctx, *, item_name: str):
     """
     OPTIONAL: Make your draft pick via command.
-    Example: !pick Patrick Mahomes
+    Example: !pick Ranger Yeert
     (Normal flow now uses plain text picks instead.)
     """
     guild_id = ctx.guild.id
