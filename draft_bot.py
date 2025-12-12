@@ -7,10 +7,9 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 # ===============================
-# SETUP
+# BOT SETUP
 # ===============================
 
-# Intents: need message_content so the bot can see text messages
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -27,44 +26,56 @@ class DraftState:
         self.owner_id = owner_id
         self.rounds = rounds
 
-        self.teams = []  # list[discord.Member]
-        self.draft_order = []  # list[discord.Member]
+        self.teams: list[discord.Member] = []
+        self.draft_order: list[discord.Member] = []
 
-        self.current_round = 1
-        self.current_index = 0  # index in draft_order
-        self.direction = 1  # 1 = forward, -1 = backward (snake)
-        self.started = False
-        self.completed = False
+        self.current_round: int = 1
+        self.current_index: int = 0  # index in draft_order
+        self.direction: int = 1  # 1 = forward, -1 = backward (snake)
+        self.started: bool = False
+        self.completed: bool = False
 
-        self.available_items = []  # list[str] - all possible picks
-        self.picks_by_team = {}  # dict[user_id, list[str]]
-        self.picked_items = set()  # set[str] - already drafted
+        self.available_items: list[str] = []
+        self.picks_by_team: dict[int, list[str]] = {}
+        self.picked_items: set[str] = set()
 
-        self.item_sides = {}  # item name -> side label (e.g., "Rangers")
-        self.last_side_picked = {}  # user_id -> last side name (or None)
-        self.turn_timer_task = None  # asyncio.Task for current turn timer
+        # Side logic
+        self.item_sides: dict[str, str] = {}  # item -> side label (e.g., "Rangers")
+        self.side_picks: dict[int, dict[str, int]] = {}  # user_id -> {side: count}
 
-        self.test_mode = False  # allow single-team drafts for testing
+        # Timer
+        self.turn_timer_task: asyncio.Task | None = None
+
+        # Modes
+        self.test_mode: bool = False  # allow single-team drafts for testing
+        self.paused: bool = False  # pause / resume support
+        self.banter_enabled: bool = False  # trash talk mode
+
+        # Where to post announcements in this guild
+        self.announce_channel_id: int | None = None
+
+        # Has the final wrapup been sent already?
+        self.wrapup_sent: bool = False
+
+    # ---------------------------
+    # Core state helpers
+    # ---------------------------
 
     def add_team(self, member: discord.Member):
         """Add a team to the draft if not already there."""
         if member not in self.teams:
             self.teams.append(member)
             self.picks_by_team[member.id] = []
-            # Initialize last_side_picked for this member
-            if member.id not in self.last_side_picked:
-                self.last_side_picked[member.id] = None
 
-    def set_pool(self, items, item_sides=None):
+    def set_pool(self, items: list[str], item_sides: dict[str, str] | None = None):
         """Set the list of available draft items."""
         self.available_items = items
         self.picked_items = set()
         self.item_sides = item_sides or {}
-        # Do not reset last_side_picked here; it's per-team over the draft
+        self.side_picks = {}
 
     def begin(self):
         """Lock teams and start the draft."""
-        # If no order chosen yet (no fliporder), default to join order.
         if not self.draft_order:
             self.draft_order = list(self.teams)
 
@@ -72,10 +83,15 @@ class DraftState:
         self.current_index = 0
         self.direction = 1
         self.started = True
+        self.completed = False
+        self.paused = False
+        self.wrapup_sent = False
 
-    def current_team(self):
+    def current_team(self) -> discord.Member | None:
         """Return the member whose turn it is now."""
         if not self.started or self.completed or not self.draft_order:
+            return None
+        if self.current_index < 0 or self.current_index >= len(self.draft_order):
             return None
         return self.draft_order[self.current_index]
 
@@ -88,10 +104,78 @@ class DraftState:
     def max_picks_total(self) -> int:
         return self.rounds * len(self.draft_order) if self.draft_order else 0
 
-    def can_pick(self, member: discord.Member, item_name: str):
+    # ---------------------------
+    # Side balancing logic
+    # ---------------------------
+
+    def _remaining_items_by_side(self) -> dict[str, int]:
+        """Helper: how many remaining items per side label."""
+        counts: dict[str, int] = {}
+        for item in self.available_items:
+            if item in self.picked_items:
+                continue
+            side = self.item_sides.get(item)
+            if not side:
+                continue
+            counts[side] = counts.get(side, 0) + 1
+        return counts
+
+    def _side_pick_allowed(self, member_id: int, side: str) -> tuple[bool, str | None]:
+        """
+        1-for-1 style side balancing:
+
+        - Applies when there are exactly 2 distinct sides
+          (e.g., Rangers / Regulars) and rounds >= 2.
+        - Each member is limited to floor(rounds / 2) picks per side.
+        - Once the OTHER side has **no remaining items**, the limit is relaxed.
+        """
+        if not self.item_sides:
+            return True, None
+
+        all_sides = set(self.item_sides.values())
+        # We only enforce this special rule for exactly 2 sides
+        if len(all_sides) != 2 or self.rounds < 2:
+            return True, None
+
+        max_per_side = self.rounds // 2
+        if max_per_side <= 0:
+            return True, None
+
+        # How many picks this member already has for this side
+        counts_for_member = self.side_picks.get(member_id, {})
+        current_for_side = counts_for_member.get(side, 0)
+
+        # Under the limit? Always okay.
+        if current_for_side < max_per_side:
+            return True, None
+
+        # At/over the limit: only allowed if the "other" side has zero remaining items.
+        other_side = next(s for s in all_sides if s != side)
+        remaining_by_side = self._remaining_items_by_side()
+        other_remaining = remaining_by_side.get(other_side, 0)
+
+        if other_remaining > 0:
+            msg = (
+                f"You've already taken the maximum number of **{side}** picks "
+                f"({max_per_side}). Your remaining picks must be from **{other_side}** "
+                "while there are still options left on that side."
+            )
+            return False, msg
+
+        # The other side is exhausted → we relax the rule and allow more of this side.
+        return True, None
+
+    # ---------------------------
+    # Picking logic
+    # ---------------------------
+
+    def can_pick(self, member: discord.Member, item_name: str) -> tuple[bool, str | None]:
         """Check if this member can pick this item now."""
         if not self.started or self.completed:
             return False, "Draft has not started or is already complete."
+
+        if self.paused:
+            return False, "The draft is currently paused."
 
         if self.current_team() != member:
             return False, "It is not your turn."
@@ -105,75 +189,30 @@ class DraftState:
         if self.total_picks_for_team(member.id) >= self.rounds:
             return False, "You have already made all your picks."
 
-        # Strict alternation logic: if there are exactly two sides,
-        # a team must alternate between them *while both sides still have options*.
         side = self.item_sides.get(item_name)
         if side is not None:
-            all_sides = set(self.item_sides.values())
-            if len(all_sides) == 2:
-                last_side = self.last_side_picked.get(member.id)
-
-                # Figure out the "other" side
-                other_side = next((s for s in all_sides if s != side), None)
-
-                # Check if the other side still has any remaining items
-                other_side_has_remaining = False
-                if other_side is not None:
-                    for i in self.available_items:
-                        if (
-                            i not in self.picked_items
-                            and self.item_sides.get(i) == other_side
-                        ):
-                            other_side_has_remaining = True
-                            break
-
-                # Only enforce alternation if:
-                #  - the last pick was from this same side, AND
-                #  - the other side still has items available.
-                if (
-                    last_side is not None
-                    and last_side == side
-                    and other_side_has_remaining
-                ):
-                    return False, (
-                        f"Your last pick was from **{last_side}**. "
-                        f"This pick must be from **{other_side}**."
-                    )
+            ok, msg = self._side_pick_allowed(member.id, side)
+            if not ok:
+                return False, msg
 
         return True, None
 
-
-        # Strict alternation logic: if there are exactly two sides,
-        # a team must alternate between them each time they pick.
-        side = self.item_sides.get(item_name)
-        if side is not None:
-            all_sides = set(self.item_sides.values())
-            if len(all_sides) == 2:
-                last_side = self.last_side_picked.get(member.id)
-                if last_side is not None and last_side == side:
-                    # Determine the other side's name for the message
-                    other_side = next(s for s in all_sides if s != side)
-                    return False, (
-                        f"Your last pick was from **{last_side}**. "
-                        f"This pick must be from **{other_side}**."
-                    )
-
-        return True, None
-
-    def make_pick(self, member: discord.Member, item_name: str):
+    def make_pick(self, member: discord.Member, item_name: str) -> tuple[bool, str | None]:
         """Record a pick and advance the turn."""
         ok, error = self.can_pick(member, item_name)
         if not ok:
             return False, error
 
         # Record pick
-        self.picks_by_team[member.id].append(item_name)
+        self.picks_by_team.setdefault(member.id, []).append(item_name)
         self.picked_items.add(item_name)
 
-        # Track side for alternation logic
+        # Track side usage
         side = self.item_sides.get(item_name)
-        if side is not None:
-            self.last_side_picked[member.id] = side
+        if side:
+            if member.id not in self.side_picks:
+                self.side_picks[member.id] = {}
+            self.side_picks[member.id][side] = self.side_picks[member.id].get(side, 0) + 1
 
         # Stop any active timer
         self.cancel_timer()
@@ -194,13 +233,13 @@ class DraftState:
 
         self.current_index += self.direction
 
-        # Went past the end
+        # Went past the end (right side)
         if self.current_index >= len(self.draft_order):
             self.current_round += 1
             self.direction = -1
             self.current_index = len(self.draft_order) - 1
 
-        # Went past the beginning
+        # Went past the beginning (left side)
         elif self.current_index < 0:
             self.current_round += 1
             self.direction = 1
@@ -214,16 +253,16 @@ class DraftState:
 
 
 # One draft per guild (server)
-guild_drafts = {}  # guild_id -> DraftState
+guild_drafts: dict[int, DraftState] = {}
 
 
 # ===============================
 # TIMER HELPERS
 # ===============================
 
-def parse_timer_duration(text: str):
+def parse_timer_duration(text: str) -> int | None:
     normalized = text.lower().replace(" ", "")
-    allowed = {
+    allowed: dict[str, int] = {
         "30": 30,
         "30s": 30,
         "30sec": 30,
@@ -248,14 +287,14 @@ def parse_timer_duration(text: str):
     return allowed.get(normalized)
 
 
-def format_duration(seconds: int):
+def format_duration(seconds: int) -> str:
     if seconds % 60 == 0:
         minutes = seconds // 60
         return f"{minutes} minute{'s' if minutes != 1 else ''}"
     return f"{seconds} seconds"
 
 
-async def run_turn_timer(ctx, draft: DraftState, duration_seconds: int):
+async def run_turn_timer(ctx: commands.Context, draft: DraftState, duration_seconds: int):
     team = draft.current_team()
     round_number = draft.current_round
     if team is None:
@@ -266,14 +305,14 @@ async def run_turn_timer(ctx, draft: DraftState, duration_seconds: int):
     except asyncio.CancelledError:
         return
 
-    # Make sure this is still the active timer
+    # Ensure this is still the active timer
     if draft.turn_timer_task != asyncio.current_task():
         return
 
     draft.turn_timer_task = None
 
-    # Make sure state hasn't advanced
-    if draft.completed or draft.current_team() != team or draft.current_round != round_number:
+    # Ensure state hasn't advanced or been paused/completed
+    if draft.completed or draft.paused or draft.current_team() != team or draft.current_round != round_number:
         return
 
     await ctx.send(f"⏰ Time's up for {team.mention}! Please make your pick.")
@@ -283,14 +322,14 @@ async def run_turn_timer(ctx, draft: DraftState, duration_seconds: int):
 # POOL PARSING (WITH SIDES)
 # ===============================
 
-def parse_pool_with_sides(text: str):
+def parse_pool_with_sides(text: str) -> list[tuple[str, list[str]]]:
     """
     Parse strings like:
     'Rangers: A, B, C | Regulars: D, E, F'
 
     Returns list of (side_name, [items...])
     """
-    groups = []
+    groups: list[tuple[str, list[str]]] = []
     for chunk in text.split("|"):
         chunk = chunk.strip()
         if not chunk:
@@ -307,7 +346,7 @@ def parse_pool_with_sides(text: str):
 
 
 # ===============================
-# EMBED HELPER
+# EMBED & MESSAGE HELPERS
 # ===============================
 
 def build_pool_embed(draft: DraftState) -> discord.Embed:
@@ -320,7 +359,6 @@ def build_pool_embed(draft: DraftState) -> discord.Embed:
     """
     remaining = [i for i in draft.available_items if i not in draft.picked_items]
 
-    # Base embed
     embed = discord.Embed(
         title="Remaining Draft Pool",
         description=f"{len(remaining)} items left",
@@ -330,7 +368,6 @@ def build_pool_embed(draft: DraftState) -> discord.Embed:
         embed.description = "No remaining items in the pool."
         return embed
 
-    # If we have side information and exactly two sides, build a table view
     if draft.item_sides:
         grouped: dict[str, list[str]] = {}
         for item in remaining:
@@ -344,9 +381,8 @@ def build_pool_embed(draft: DraftState) -> discord.Embed:
             right_items = grouped[right_side]
 
             max_rows = max(len(left_items), len(right_items))
-            max_rows_shown = min(max_rows, 20)  # keep under Discord field limit
+            max_rows_shown = min(max_rows, 20)
 
-            # Build table lines using monospaced formatting
             header = f"{left_side:<16} | {right_side:<16}"
             divider = "-" * len(header)
             rows = [header, divider]
@@ -373,7 +409,7 @@ def build_pool_embed(draft: DraftState) -> discord.Embed:
             )
             return embed
 
-    # Fallback: simple single-column list (old behavior)
+    # Fallback: simple list
     max_show = 25
     lines = [f"- {name}" for name in remaining[:max_show]]
     more_count = len(remaining) - max_show
@@ -386,24 +422,234 @@ def build_pool_embed(draft: DraftState) -> discord.Embed:
     return embed
 
 
-    # Show up to 25 items nicely formatted
-    max_show = 25
-    lines = [f"- {name}" for name in remaining[:max_show]]
-    more_count = len(remaining) - max_show
+def get_side_hint(draft: DraftState) -> str:
+    """Return a hint about which side(s) the next player can/must pick from."""
+    member = draft.current_team()
+    if member is None or not draft.item_sides:
+        return ""
 
-    text = "\n".join(lines)
-    if more_count > 0:
-        text += f"\n\n+ {more_count} more not shown..."
+    # Determine all sides and remaining items per side
+    all_sides = set(draft.item_sides.values())
+    if not all_sides:
+        return ""
 
-    embed.add_field(name="Available", value=text, inline=False)
+    remaining_by_side = draft._remaining_items_by_side()
+    if not remaining_by_side:
+        return ""
 
-    return embed
+    allowed_sides: list[str] = []
+    blocked_reasons: dict[str, str] = {}
+
+    for side in all_sides:
+        if remaining_by_side.get(side, 0) <= 0:
+            continue
+        ok, msg = draft._side_pick_allowed(member.id, side)
+        if ok:
+            allowed_sides.append(side)
+        elif msg:
+            blocked_reasons[side] = msg
+
+    if len(allowed_sides) == 0:
+        return "No valid sides remain for your picks."
+
+    if len(allowed_sides) == 1:
+        side = allowed_sides[0]
+        other_sides = [s for s in all_sides if s != side and s in blocked_reasons]
+        if other_sides:
+            others_str = ", ".join(other_sides)
+            return f"Your next pick must be from **{side}** (you cannot pick from {others_str})."
+        return f"Your next pick must be from **{side}**."
+
+    if len(allowed_sides) == 2:
+        a, b = allowed_sides[0], allowed_sides[1]
+        return f"You may pick from **{a}** or **{b}**."
+
+    sides_str = ", ".join(allowed_sides)
+    return f"You may pick from: {sides_str}."
+
+
+def build_next_turn_message(draft: DraftState) -> str:
+    """Combine next-up announcement with side hint."""
+    member = draft.current_team()
+    if member is None:
+        return "No active turn."
+
+    base = f"Next up: {member.mention} (Round {draft.current_round})"
+    hint = get_side_hint(draft)
+    if hint:
+        return base + "\n" + hint
+    return base
+
+
+async def maybe_send_banter_after_pick(
+    channel: discord.abc.Messageable,
+    draft: DraftState,
+    picker: discord.Member,
+    item_name: str,
+):
+    """Send a random banter line if banter mode is enabled."""
+    if not draft.banter_enabled:
+        return
+
+    # Basic 40% chance per normal pick
+    if not draft.completed and random.random() > 0.4:
+        return
+
+    side = draft.item_sides.get(item_name)
+    side_label = f" ({side})" if side else ""
+
+    generic_lines = [
+        f"🔥 Bold pick, {picker.display_name}. Let's see if it pays off.",
+        f"💀 That’s either genius or madness, {picker.display_name}. No in-between.",
+        f"🎲 Interesting choice, {picker.display_name}. I would've panic-picked by now.",
+    ]
+
+    side_lines = [
+        f"⚔️ Another one for **{side}**. The other side looks nervous.",
+        f"🛡️ **{side}** just gained a new victim—uh, teammate.",
+    ] if side else []
+
+    finale_lines = [
+        "🎉 Draft complete! Time to pretend every pick was part of the plan.",
+        "🏁 That’s the draft! May your choices age like fine wine and not milk.",
+    ]
+
+    # Special: end-of-draft banter
+    if draft.completed:
+        line = random.choice(finale_lines)
+        await channel.send(line)
+        return
+
+    # Normal pick banter
+    candidates = generic_lines + side_lines
+    if not candidates:
+        return
+    line = random.choice(candidates)
+    await channel.send(line)
+
+
+def build_teams_table(draft: DraftState) -> str:
+    """Build a text table of each team's picks, side-by-side."""
+    teams = draft.draft_order if draft.draft_order else draft.teams
+    if not teams:
+        return ""
+
+    picks_by_team = [draft.picks_by_team.get(team.id, []) for team in teams]
+    column_widths: list[int] = []
+    for team, picks in zip(teams, picks_by_team):
+        longest_pick = max((len(pick) for pick in picks), default=0)
+        column_widths.append(max(len(team.display_name), longest_pick) + 2)
+
+    header = " | ".join(
+        team.display_name.ljust(width) for team, width in zip(teams, column_widths)
+    )
+
+    max_rows = max((len(picks) for picks in picks_by_team), default=0)
+    if max_rows == 0:
+        return header
+
+    rows = []
+    for i in range(max_rows):
+        row = " | ".join(
+            (picks[i] if i < len(picks) else "").ljust(width)
+            for picks, width in zip(picks_by_team, column_widths)
+        )
+        rows.append(row)
+
+    table = "\n".join([header] + rows)
+    return table
+
+
+def write_draft_log_file(draft: DraftState, guild_id: int) -> str:
+    """Write the draft log to a .txt file and return the filename."""
+    filename = f"draft_log_{guild_id}.txt"
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("=== DRAFT LOG ===\n\n")
+        f.write(f"Total Rounds: {draft.rounds}\n\n")
+
+        f.write("Draft Order:\n")
+        if draft.draft_order:
+            for idx, member in enumerate(draft.draft_order):
+                f.write(f"{idx + 1}. {member.display_name}\n")
+        else:
+            f.write("Draft order not set.\n")
+        f.write("\n")
+
+        teams = draft.draft_order if draft.draft_order else draft.teams
+        for member in teams:
+            f.write(f"{member.display_name}'s Picks:\n")
+            picks = draft.picks_by_team.get(member.id, [])
+            if picks:
+                for i, pick in enumerate(picks, 1):
+                    f.write(f"  {i}. {pick}\n")
+            else:
+                f.write("  No picks.\n")
+            f.write("\n")
+
+    return filename
+
+
+async def send_draft_wrapup(channel: discord.abc.Messageable, draft: DraftState, guild_id: int):
+    """
+    Send a final wrapup summary and automatically export the draft log.
+    Only runs once per draft (guarded by draft.wrapup_sent).
+    """
+    if draft.wrapup_sent:
+        return
+    draft.wrapup_sent = True
+
+    # 1) Announce completion
+    await channel.send("🎉 Draft is complete!")
+
+    # 2) Final board (teams table)
+    table = build_teams_table(draft)
+    if table:
+        await channel.send(f"📋 **Final Draft Board:**\n```{table}```")
+
+    # 3) Side totals, if using sides
+    if draft.item_sides:
+        # Overall side totals
+        side_totals: dict[str, int] = {}
+        per_team_side_totals: dict[int, dict[str, int]] = {}
+
+        for member_id, picks in draft.picks_by_team.items():
+            for pick in picks:
+                side = draft.item_sides.get(pick)
+                if not side:
+                    continue
+                side_totals[side] = side_totals.get(side, 0) + 1
+
+                team_counts = per_team_side_totals.setdefault(member_id, {})
+                team_counts[side] = team_counts.get(side, 0) + 1
+
+        if side_totals:
+            overall_lines = [f"{side}: {count}" for side, count in side_totals.items()]
+            overall_text = ", ".join(overall_lines)
+            await channel.send(f"⚖️ **Side Totals:** {overall_text}")
+
+            # Per-team breakdown
+            lines = []
+            teams = draft.draft_order if draft.draft_order else draft.teams
+            for member in teams:
+                counts = per_team_side_totals.get(member.id, {})
+                if not counts:
+                    continue
+                parts = [f"{side}: {count}" for side, count in counts.items()]
+                parts_text = ", ".join(parts)
+                lines.append(f"{member.display_name} → {parts_text}")
+
+            if lines:
+                await channel.send("📊 **Per-Team Side Breakdown:**\n" + "\n".join(lines))
+
+    # 4) Auto-export log file
+    filename = write_draft_log_file(draft, guild_id)
+    await channel.send("📄 Final draft log exported automatically:", file=discord.File(filename))
 
 
 # ===============================
 # EVENTS
 # ===============================
-
 
 @bot.event
 async def on_ready():
@@ -414,13 +660,14 @@ async def on_ready():
 
 
 # ===============================
-# AUTO-PICK LOGIC (TYPE NAME INSTEAD OF !pick)
+# AUTO-PICK LOGIC
+# (TYPE NAME INSTEAD OF !pick)
 # ===============================
 
 async def try_auto_pick(message: discord.Message):
     """Try to interpret the user's message as a pick."""
     if message.guild is None:
-        return  # ignore DMs
+        return  # ignore DMs for autopick
 
     guild_id = message.guild.id
     draft = guild_drafts.get(guild_id)
@@ -433,6 +680,10 @@ async def try_auto_pick(message: discord.Message):
 
     # Only react if it's this member's turn
     if draft.current_team() != member:
+        return
+
+    if draft.paused:
+        await message.channel.send("❌ The draft is currently paused. Please wait for `!resume`.")
         return
 
     text = message.content.strip()
@@ -478,26 +729,30 @@ async def try_auto_pick(message: discord.Message):
             )
             return
         else:
+            # No match; silently ignore so people can chat
             return
 
-    # Make the pick
+    # At this point, matched_item is a unique, valid remaining item
     ok, error = draft.make_pick(member, matched_item)
     if not ok:
         await message.channel.send(f"❌ {error}")
         return
 
+    # Confirm the pick
     await message.channel.send(f"✅ {member.mention} drafted **{matched_item}**!")
 
-    # Show remaining pool
+    # Show remaining pool as an embed
     pool_embed = build_pool_embed(draft)
     await message.channel.send(embed=pool_embed)
 
+    # Banter (if enabled)
+    await maybe_send_banter_after_pick(message.channel, draft, member, matched_item)
+
+    # Turn / completion info + wrapup
     if draft.completed:
-        await message.channel.send("🎉 Draft is complete!")
+        await send_draft_wrapup(message.channel, draft, message.guild.id)
     else:
-        await message.channel.send(
-            f"Next up: {draft.current_team().mention} (Round {draft.current_round})"
-        )
+        await message.channel.send(build_next_turn_message(draft))
 
 
 @bot.event
@@ -506,10 +761,13 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Try to auto-pick based on plain text (no prefix)
-    await try_auto_pick(message)
+    # In guild text channels, try auto-pick then commands
+    if message.guild is not None:
+        await try_auto_pick(message)
+        await bot.process_commands(message)
+        return
 
-    # Still allow traditional commands like !startdraft, !status, etc.
+    # In DMs, just process commands (if you ever add any)
     await bot.process_commands(message)
 
 
@@ -517,9 +775,8 @@ async def on_message(message: discord.Message):
 # UTILITY COMMANDS
 # ===============================
 
-
 @bot.command()
-async def ping(ctx):
+async def ping(ctx: commands.Context):
     """Simple test command."""
     await ctx.send("Pong!")
 
@@ -528,13 +785,16 @@ async def ping(ctx):
 # DRAFT COMMANDS
 # ===============================
 
-
 @bot.command(name="startdraft")
-async def start_draft(ctx, rounds: int):
+async def start_draft(ctx: commands.Context, rounds: int):
     """
     Start a new draft.
     Example: !startdraft 5
     """
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
 
     if guild_id in guild_drafts and not guild_drafts[guild_id].completed:
@@ -542,23 +802,28 @@ async def start_draft(ctx, rounds: int):
         return
 
     draft = DraftState(owner_id=ctx.author.id, rounds=rounds)
+    draft.announce_channel_id = ctx.channel.id
     guild_drafts[guild_id] = draft
 
     await ctx.send(
         f"🎲 Draft created by {ctx.author.mention} for **{rounds} rounds**.\n"
         f"Others can join with `!join`.\n"
-        f"The owner can set the pool with `!setpool` or `!setpooldm`, and can randomize order with `!fliporder`.\n"
+        f"The owner can set the pool with `!setpool` or `!setpooldm`, and can randomize order with `!fliporder` or `!coinflip`.\n"
         f"Once the draft starts, players just type the name (or part of the name) of the item to pick."
     )
 
 
 @bot.command(name="testmode")
-async def enable_test_mode(ctx):
+async def enable_test_mode(ctx: commands.Context):
     """
     Enable test mode for the current draft.
     In test mode, you are allowed to begin the draft with only one team.
     Great for solo testing.
     """
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -577,8 +842,12 @@ async def enable_test_mode(ctx):
 
 
 @bot.command(name="join")
-async def join_draft(ctx):
+async def join_draft(ctx: commands.Context):
     """Join the active draft before it begins."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -595,15 +864,19 @@ async def join_draft(ctx):
 
 
 @bot.command(name="setpool")
-async def set_pool(ctx, *, items_text: str):
+async def set_pool(ctx: commands.Context, *, items_text: str):
     """
     Set the draft pool as a comma-separated list (in-channel).
     Example:
-    !setpool Player A, Player B, Player C
+    !setpool Patrick Mahomes, CeeDee Lamb, Christian McCaffrey
 
     You can also group by side for clarity (e.g., real teams):
-    !setpool Rangers: Yeert, Fusion, Mike | Regulars: Bob, Alice, Carol
+    !setpool Rangers: Option 1, Option 2 | Regulars: Option 3, Option 4
     """
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -618,8 +891,8 @@ async def set_pool(ctx, *, items_text: str):
     side_groups = parse_pool_with_sides(items_text)
 
     if side_groups:
-        items = []
-        item_sides = {}
+        items: list[str] = []
+        item_sides: dict[str, str] = {}
         for side, entries in side_groups:
             for item in entries:
                 if item in item_sides:
@@ -638,7 +911,7 @@ async def set_pool(ctx, *, items_text: str):
     draft.set_pool(items, item_sides)
 
     if item_sides:
-        counts_by_side = {}
+        counts_by_side: dict[str, int] = {}
         for side in item_sides.values():
             counts_by_side[side] = counts_by_side.get(side, 0) + 1
         side_counts = ", ".join(f"{side}: {count}" for side, count in counts_by_side.items())
@@ -654,11 +927,15 @@ async def set_pool(ctx, *, items_text: str):
 
 
 @bot.command(name="setpooldm")
-async def set_pool_dm(ctx):
+async def set_pool_dm(ctx: commands.Context):
     """
     Start a DM with the draft owner to set the draft pool.
     The owner will paste a list of items (comma- or newline-separated) in DM.
     """
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -680,9 +957,9 @@ async def set_pool_dm(ctx):
             "Please send me a message containing **all items** you want in the pool.\n"
             "You can separate them by **commas** or put **one per line**.\n\n"
             "Example:\n"
-            "`Player A, Player B, Player C`\n"
+            "`Patrick Mahomes, Josh Allen, Joe Burrow`\n"
             "or\n"
-            "`Player A\nPlayer B\nPlayer C`"
+            "`Patrick Mahomes\nJosh Allen\nJoe Burrow`"
         )
     except discord.Forbidden:
         await ctx.send(
@@ -707,7 +984,6 @@ async def set_pool_dm(ctx):
     raw_text = msg.content.replace("\r\n", "\n")  # normalize newlines
     raw_text = raw_text.replace("\r", "\n")
 
-    # Replace newlines with commas so we can split once
     combined = raw_text.replace("\n", ",")
     items = [i.strip() for i in combined.split(",") if i.strip()]
 
@@ -715,26 +991,28 @@ async def set_pool_dm(ctx):
         await user.send("❌ I didn't find any valid items in your message. Please try `!setpooldm` again.")
         return
 
-    # Set the pool (no sides from DM in this version)
-    draft.set_pool(items)
+    draft.set_pool(items, {})
 
     await user.send(
         f"✅ Your draft pool has been set with **{len(items)}** items.\n"
         "You can now start the draft with `!begin` in the server."
     )
 
-    # Let the server know (without spamming the item list)
     await ctx.send(
         f"✅ {user.mention} has set the draft pool via DM with **{len(items)}** items."
     )
 
 
 @bot.command(name="fliporder")
-async def flip_order(ctx):
+async def flip_order(ctx: commands.Context):
     """
     Randomize the draft order using the teams that have joined.
     Only the draft owner can do this, and only before the draft begins.
     """
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -768,9 +1046,61 @@ async def flip_order(ctx):
     )
 
 
+@bot.command(name="coinflip")
+async def coinflip(ctx: commands.Context):
+    """
+    Flip a coin between exactly two joined teams to determine who gets first pick.
+    Sets the draft order to [winner, loser].
+    """
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
+    guild_id = ctx.guild.id
+    draft = guild_drafts.get(guild_id)
+
+    if draft is None:
+        await ctx.send("❌ No active draft. Start one with `!startdraft` first.")
+        return
+
+    if draft.started:
+        await ctx.send("❌ Draft has already started. You cannot coinflip the order now.")
+        return
+
+    if ctx.author.id != draft.owner_id:
+        await ctx.send("❌ Only the draft owner can run the coinflip.")
+        return
+
+    if len(draft.teams) != 2:
+        await ctx.send(
+            "❌ Coinflip is only supported when exactly **2** teams have joined.\n"
+            "Make sure exactly two players have used `!join`."
+        )
+        return
+
+    # Randomly choose winner & loser
+    winner = random.choice(draft.teams)
+    loser = draft.teams[0] if draft.teams[1] == winner else draft.teams[1]
+
+    draft.draft_order = [winner, loser]
+
+    await ctx.send(
+        "🪙 **Coinflip result!**\n"
+        f"Winner: {winner.mention} — you get **first pick**.\n"
+        f"Draft order will be:\n"
+        f"1️⃣ {winner.display_name}\n"
+        f"2️⃣ {loser.display_name}\n\n"
+        "Use `!begin` to start the draft with this order."
+    )
+
+
 @bot.command(name="begin")
-async def begin_draft(ctx):
+async def begin_draft(ctx: commands.Context):
     """Begin the draft (lock teams and start snake order)."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -786,7 +1116,6 @@ async def begin_draft(ctx):
         await ctx.send("❌ Draft has already started.")
         return
 
-    # Require 2+ teams normally, but allow 1 team in test mode
     if len(draft.teams) < 2 and not draft.test_mode:
         await ctx.send("❌ You need at least 2 teams to begin the draft.")
         return
@@ -801,22 +1130,25 @@ async def begin_draft(ctx):
     await ctx.send(
         "🚨 **Draft has begun!**\n"
         f"**Order:** {order_names}\n"
-        f"Current turn: {draft.current_team().mention} (Round {draft.current_round})\n"
+        f"{build_next_turn_message(draft)}\n"
         f"To pick, just type the item name (case-insensitive, partials allowed)."
     )
 
-    # Show the pool immediately when the draft begins
     pool_embed = build_pool_embed(draft)
     await ctx.send(embed=pool_embed)
 
 
 @bot.command(name="pick")
-async def make_pick_cmd(ctx, *, item_name: str):
+async def make_pick_command(ctx: commands.Context, *, item_name: str):
     """
     OPTIONAL: Make your draft pick via command.
-    Example: !pick Ranger Yeert
+    Example: !pick Patrick Mahomes
     (Normal flow now uses plain text picks instead.)
     """
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -831,22 +1163,24 @@ async def make_pick_cmd(ctx, *, item_name: str):
 
     await ctx.send(f"✅ {ctx.author.mention} drafted **{item_name}**!")
 
-    # Show remaining pool as an embed
     pool_embed = build_pool_embed(draft)
     await ctx.send(embed=pool_embed)
 
-    # Turn / completion info
+    await maybe_send_banter_after_pick(ctx.channel, draft, ctx.author, item_name)
+
     if draft.completed:
-        await ctx.send("🎉 Draft is complete!")
+        await send_draft_wrapup(ctx.channel, draft, ctx.guild.id)
     else:
-        await ctx.send(
-            f"Next up: {draft.current_team().mention} (Round {draft.current_round})"
-        )
+        await ctx.send(build_next_turn_message(draft))
 
 
 @bot.command(name="status")
-async def draft_status(ctx):
+async def draft_status(ctx: commands.Context):
     """Show current draft status."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -862,21 +1196,29 @@ async def draft_status(ctx):
         )
         return
 
-    if draft.completed:
-        await ctx.send("✅ Draft is complete.")
-        return
+    status_lines = [
+        f"📊 **Draft Status**",
+        f"Round: {draft.current_round}/{draft.rounds}",
+        f"Total picks made: {draft.total_picks_made()}/{draft.max_picks_total()}",
+    ]
 
-    await ctx.send(
-        f"📊 **Draft Status**\n"
-        f"Round: {draft.current_round}/{draft.rounds}\n"
-        f"Current turn: {draft.current_team().mention}\n"
-        f"Total picks made: {draft.total_picks_made()}/{draft.max_picks_total()}"
-    )
+    if draft.paused:
+        status_lines.append("State: ⏸️ Paused")
+    elif draft.completed:
+        status_lines.append("State: ✅ Complete")
+    else:
+        status_lines.append(f"Current turn: {draft.current_team().mention}")
+
+    await ctx.send("\n".join(status_lines))
 
 
 @bot.command(name="mypicks")
-async def my_picks(ctx):
+async def my_picks(ctx: commands.Context):
     """Show your personal picks."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -894,8 +1236,12 @@ async def my_picks(ctx):
 
 
 @bot.command(name="pool")
-async def show_pool(ctx):
+async def show_pool(ctx: commands.Context):
     """Show remaining items in the draft pool."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -910,8 +1256,7 @@ async def show_pool(ctx):
         return
 
     if draft.item_sides:
-        # Show grouped by side
-        grouped = {}
+        grouped: dict[str, list[str]] = {}
         for item in remaining:
             side = draft.item_sides.get(item, "Unspecified")
             grouped.setdefault(side, []).append(item)
@@ -927,14 +1272,17 @@ async def show_pool(ctx):
             f"📦 Remaining items by side ({len(remaining)} total):\n{lines_text}"
         )
     else:
-        # Use the embed view
         embed = build_pool_embed(draft)
         await ctx.send(embed=embed)
 
 
 @bot.command(name="order")
-async def show_order(ctx):
+async def show_order(ctx: commands.Context):
     """Show draft order (teams)."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -943,7 +1291,7 @@ async def show_order(ctx):
         return
 
     if not draft.draft_order:
-        await ctx.send("ℹ️ Draft order not set yet. Use `!fliporder` or `!begin`.")
+        await ctx.send("ℹ️ Draft order not set yet. Use `!fliporder`, `!coinflip`, or `!begin`.")
         return
 
     order = "\n".join(
@@ -953,8 +1301,12 @@ async def show_order(ctx):
 
 
 @bot.command(name="teams")
-async def show_teams(ctx):
+async def show_teams(ctx: commands.Context):
     """Show each team's picks in a side-by-side table."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -962,42 +1314,21 @@ async def show_teams(ctx):
         await ctx.send("❌ No active draft.")
         return
 
-    teams = draft.draft_order if draft.draft_order else draft.teams
-    if not teams:
+    table = build_teams_table(draft)
+    if not table:
         await ctx.send("ℹ️ No teams have joined the draft yet.")
         return
 
-    # Build column widths based on team names and their longest pick
-    picks_by_team = [draft.picks_by_team.get(team.id, []) for team in teams]
-    column_widths = []
-    for team, picks in zip(teams, picks_by_team):
-        longest_pick = max((len(pick) for pick in picks), default=0)
-        column_widths.append(max(len(team.display_name), longest_pick) + 2)
-
-    header = " | ".join(
-        team.display_name.ljust(width) for team, width in zip(teams, column_widths)
-    )
-
-    max_rows = max((len(picks) for picks in picks_by_team), default=0)
-    if max_rows == 0:
-        await ctx.send(f"📋 Teams:\n```{header}```")
-        return
-
-    rows = []
-    for i in range(max_rows):
-        row = " | ".join(
-            (picks[i] if i < len(picks) else "").ljust(width)
-            for picks, width in zip(picks_by_team, column_widths)
-        )
-        rows.append(row)
-
-    table = "\n".join([header] + rows)
     await ctx.send(f"📋 Teams:\n```{table}```")
 
 
 @bot.command(name="timer")
-async def start_timer(ctx, *, duration: str):
+async def start_timer(ctx: commands.Context, *, duration: str):
     """Start a turn timer (owner only). Options: 30s, 1m, 90s, 2m."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -1037,13 +1368,121 @@ async def start_timer(ctx, *, duration: str):
     )
 
 
+# ===============================
+# PAUSE / RESUME COMMANDS
+# ===============================
+
+@bot.command(name="pause")
+async def pause_draft(ctx: commands.Context):
+    """Pause the current draft (no picks allowed while paused)."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
+    guild_id = ctx.guild.id
+    draft = guild_drafts.get(guild_id)
+
+    if draft is None:
+        await ctx.send("❌ No active draft to pause.")
+        return
+
+    if draft.completed:
+        await ctx.send("❌ The draft is already complete.")
+        return
+
+    # Only owner or admin
+    if ctx.author.id != draft.owner_id and not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ Only the draft owner or a server admin can pause the draft.")
+        return
+
+    if draft.paused:
+        await ctx.send("⏸️ The draft is already paused.")
+        return
+
+    draft.paused = True
+    draft.cancel_timer()
+
+    await ctx.send(f"⏸️ Draft paused by {ctx.author.mention}. No picks can be made until `!resume`.")
+
+
+@bot.command(name="resume")
+async def resume_draft(ctx: commands.Context):
+    """Resume a previously paused draft."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
+    guild_id = ctx.guild.id
+    draft = guild_drafts.get(guild_id)
+
+    if draft is None:
+        await ctx.send("❌ No active draft to resume.")
+        return
+
+    if draft.completed:
+        await ctx.send("❌ The draft is already complete.")
+        return
+
+    if ctx.author.id != draft.owner_id and not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ Only the draft owner or a server admin can resume the draft.")
+        return
+
+    if not draft.paused:
+        await ctx.send("▶️ The draft is not currently paused.")
+        return
+
+    draft.paused = False
+    await ctx.send(f"▶️ Draft resumed by {ctx.author.mention}.\n{build_next_turn_message(draft)}")
+
+
+# ===============================
+# BANTER TOGGLE
+# ===============================
+
+@bot.command(name="banter")
+async def toggle_banter(ctx: commands.Context, mode: str):
+    """Toggle banter mode on/off for this draft."""
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
+    guild_id = ctx.guild.id
+    draft = guild_drafts.get(guild_id)
+
+    if draft is None:
+        await ctx.send("❌ No active draft to configure.")
+        return
+
+    if ctx.author.id != draft.owner_id and not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ Only the draft owner or a server admin can change banter mode.")
+        return
+
+    mode_lower = mode.lower()
+    if mode_lower in ("on", "enable", "enabled"):
+        draft.banter_enabled = True
+        await ctx.send("😈 Banter mode enabled. Expect sarcasm.")
+    elif mode_lower in ("off", "disable", "disabled"):
+        draft.banter_enabled = False
+        await ctx.send("🤐 Banter mode disabled. I'll behave now.")
+    else:
+        await ctx.send("❌ Invalid mode. Use `!banter on` or `!banter off`.")
+
+
+# ===============================
+# FORCE STOP COMMAND
+# ===============================
+
 @bot.command(name="forcestop")
 @commands.has_permissions(administrator=True)
-async def force_stop(ctx):
+async def force_stop(ctx: commands.Context):
     """
     Force stop the current draft (admin or draft owner).
     Deletes draft state for this server.
     """
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -1060,11 +1499,19 @@ async def force_stop(ctx):
     await ctx.send("⛔ **The draft has been forcefully stopped.** All draft data has been cleared.")
 
 
+# ===============================
+# EXPORT DRAFT LOG
+# ===============================
+
 @bot.command(name="exportdraft")
-async def export_draft(ctx):
+async def export_draft(ctx: commands.Context):
     """
     Export the full draft log and upload it as a .txt file.
     """
+    if ctx.guild is None:
+        await ctx.send("❌ This command can only be used in a server.")
+        return
+
     guild_id = ctx.guild.id
     draft = guild_drafts.get(guild_id)
 
@@ -1072,30 +1519,7 @@ async def export_draft(ctx):
         await ctx.send("❌ No active draft or draft data to export.")
         return
 
-    filename = f"draft_log_{guild_id}.txt"
-
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write("=== DRAFT LOG ===\n\n")
-        f.write(f"Total Rounds: {draft.rounds}\n\n")
-
-        f.write("Draft Order:\n")
-        if draft.draft_order:
-            for idx, member in enumerate(draft.draft_order):
-                f.write(f"{idx + 1}. {member.display_name}\n")
-        else:
-            f.write("Draft order not set.\n")
-        f.write("\n")
-
-        for member in draft.draft_order:
-            f.write(f"{member.display_name}'s Picks:\n")
-            picks = draft.picks_by_team.get(member.id, [])
-            if picks:
-                for i, pick in enumerate(picks, 1):
-                    f.write(f"  {i}. {pick}\n")
-            else:
-                f.write("  No picks.\n")
-            f.write("\n")
-
+    filename = write_draft_log_file(draft, guild_id)
     await ctx.send("📄 Draft log exported:", file=discord.File(filename))
 
 
